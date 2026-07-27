@@ -444,7 +444,33 @@ class LTX2Attention(Attention):
         attn_kwargs = {}
         if key_padding_mask is not None:
             attn_kwargs["key_padding_mask"] = key_padding_mask
-        out = self._attn_impl(q, k, v, timestep=timestep, **attn_kwargs)
+
+        # Layer 3: FA3 FP8 in-patch path for video self-attention.
+        # Uses pre-cached imports (set externally on class attrs _fa3_fp8_fi / _fa3_fp8_qfn)
+        # to eliminate per-call import overhead. GPU quantization kernel — no CPU sync for quant.
+        _cls = self.__class__
+        if (getattr(_cls, '_fa3_fp8', False)
+                and self.qkv_mode == QKVMode.FUSE_QKV
+                and q.shape[1] == 23760):
+            _fi   = _cls._fa3_fp8_fi   # flashinfer module (pre-cached)
+            _qfp8 = _cls._fa3_fp8_qfn  # quantize_fp8_per_tensor (pre-cached)
+            B_l3, T_l3, HD = q.shape
+            H_l3, D_l3 = self.num_attention_heads, self.head_dim
+            # GPU quantize: (T, H*D) → FP8 + dequant scale; no CPU reduction
+            q_fp8, q_sc = _qfp8(q.contiguous().view(T_l3, HD))
+            k_fp8, k_sc = _qfp8(k.contiguous().view(T_l3, HD))
+            v_fp8, v_sc = _qfp8(v.contiguous().view(T_l3, HD))
+            # Reshape to (T, H, D) for FlashInfer FA3
+            attn_out = _fi.single_prefill_with_kv_cache(
+                q_fp8.view(T_l3, H_l3, D_l3),
+                k_fp8.view(T_l3, H_l3, D_l3),
+                v_fp8.view(T_l3, H_l3, D_l3),
+                scale_q=q_sc.item(), scale_k=k_sc.item(), scale_v=v_sc.item(),
+                o_dtype=q.dtype, causal=False, backend='fa3')
+            # attn_out: (T, H, D) → (B, T, H*D)
+            out = attn_out.reshape(B_l3, T_l3, H_l3 * D_l3)
+        else:
+            out = self._attn_impl(q, k, v, timestep=timestep, **attn_kwargs)
 
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(x)
