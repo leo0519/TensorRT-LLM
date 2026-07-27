@@ -369,21 +369,30 @@ class LTX2Attention(Attention):
 
         if self.qkv_mode == QKVMode.FUSE_QKV:
             # ─── sync self-attn ───
-            if use_fused and pe is not None:
-                # Fused packed kernel: norm + RoPE on QKV in-place.
-                qkv = self.qkv_proj(x)
-                cos, sin = pe
-                self.apply_packed_qk_norm_rope(qkv, cos, sin)
-                q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
-            else:
-                # Naive (mini-config head_dim ∉ {64, 128}).
-                q, k, v = self.get_qkv(x)
-                if self.qk_norm:
-                    q = self.norm_q(q)
-                    k = self.norm_k(k)
-                if pe is not None:
-                    q = apply_rotary_emb(q, pe, self.rope_type)
-                    k = apply_rotary_emb(k, pe, self.rope_type)
+            # Separate norm + RoPE matching ltx_core exactly.
+            # CRITICAL: apply_rotary_emb expects (B, T, H, D) not flat (B, T, H*D).
+            # Reshape before RoPE, flatten after.
+            q, k, v = self.get_qkv(x)
+            B_q, T_q, _ = q.shape
+            if self.qk_norm:
+                q = self.norm_q(q)  # (B, T, H*D)
+                k = self.norm_k(k)  # (B, T, H*D)
+            if pe is not None:
+                # _make_pe_local with fuse=True collapses (B,T,H,D) → (T,H*D).
+                # Reshape back to (1,T,H,D) for eager apply_rotary_emb.
+                cos_pe, sin_pe = pe
+                if cos_pe.ndim == 2:
+                    cos_pe = cos_pe.view(T_q, self.num_attention_heads, self.head_dim).unsqueeze(0)
+                    sin_pe = sin_pe.view(T_q, self.num_attention_heads, self.head_dim).unsqueeze(0)
+                pe4d = (cos_pe, sin_pe)
+                q = apply_rotary_emb(
+                    q.view(B_q, T_q, self.num_attention_heads, self.head_dim),
+                    pe4d, self.rope_type
+                ).view(B_q, T_q, self.num_attention_heads * self.head_dim)
+                k = apply_rotary_emb(
+                    k.view(B_q, T_q, self.num_key_value_heads, self.head_dim),
+                    pe4d, self.rope_type
+                ).view(B_q, T_q, self.num_key_value_heads * self.head_dim)
 
         elif self.qkv_mode == QKVMode.SEPARATE_QKV:
             if pre_projected_kv is not None:
