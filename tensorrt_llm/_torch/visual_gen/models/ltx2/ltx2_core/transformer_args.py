@@ -37,6 +37,9 @@ class TransformerArgs:
     # divisible by ulysses_size). Identical across Ulysses ranks (full-seq).
     # None when no padding is applied.
     audio_padding_mask: torch.Tensor | None = None
+    # LTX-2.3 cross_attention_adaln: per-step prompt adaln output [B, T, 2*dim]
+    # for text-KV modulation. None when cross_attention_adaln=False.
+    prompt_timestep: torch.Tensor | None = None
 
 
 class TransformerArgsPreprocessor:
@@ -59,10 +62,12 @@ class TransformerArgsPreprocessor:
         double_precision_rope: bool,
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
+        prompt_adaln: AdaLayerNormSingle | None = None,
     ) -> None:
         self.patchify_proj = patchify_proj
         self.adaln = adaln
         self.caption_projection = caption_projection
+        self.prompt_adaln = prompt_adaln
         self.inner_dim = inner_dim
         self.max_pos = max_pos
         self.num_attention_heads = num_attention_heads
@@ -106,13 +111,16 @@ class TransformerArgsPreprocessor:
 
     def _prepare_positional_embeddings(
         self,
-        positions: torch.Tensor,
+        positions: torch.Tensor | None,
         inner_dim: int,
         max_pos: list[int],
         use_middle_indices_grid: bool,
         num_attention_heads: int,
         x_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        # Text context (Gemma output) has no positional encoding — skip RoPE.
+        if positions is None:
+            return None
         freq_grid_generator = (
             _generate_freq_grid_np if self.double_precision_rope else _generate_freq_grid_pytorch
         )
@@ -170,6 +178,13 @@ class TransformerArgsPreprocessor:
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], modality.latent.dtype
         )
+        prompt_timestep = None
+        if self.prompt_adaln is not None:
+            # Use per-batch sigma (matches ltx_core: modality.sigma shape (B,))
+            raw_ts = modality.sigma * self.timestep_scale_multiplier  # (B,)
+            pt, _ = self.prompt_adaln(raw_ts, hidden_dtype=modality.latent.dtype)
+            prompt_timestep = pt.unsqueeze(1)  # (B, 1, 2*dim) — broadcasts over text tokens
+
         return TransformerArgs(
             x=x,
             context=static_context,
@@ -181,6 +196,7 @@ class TransformerArgsPreprocessor:
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
             enabled=modality.enabled,
+            prompt_timestep=prompt_timestep,
         )
 
 
@@ -205,6 +221,7 @@ class MultiModalTransformerArgsPreprocessor:
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
         av_ca_timestep_scale_multiplier: int,
+        prompt_adaln: AdaLayerNormSingle | None = None,
     ) -> None:
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
@@ -218,6 +235,7 @@ class MultiModalTransformerArgsPreprocessor:
             double_precision_rope=double_precision_rope,
             positional_embedding_theta=positional_embedding_theta,
             rope_type=rope_type,
+            prompt_adaln=prompt_adaln,
         )
         self.cross_scale_shift_adaln = cross_scale_shift_adaln
         self.cross_gate_adaln = cross_gate_adaln
@@ -243,13 +261,17 @@ class MultiModalTransformerArgsPreprocessor:
         """
         sp = self.simple_preprocessor
         context, mask, pe, _ = sp.prepare_text_cache(context, context_mask, positions, dtype)
-        cross_pe = sp._prepare_positional_embeddings(
-            positions=positions[:, 0:1, :],
-            inner_dim=self.audio_cross_attention_dim,
-            max_pos=[self.cross_pe_max_pos],
-            use_middle_indices_grid=True,
-            num_attention_heads=sp.num_attention_heads,
-            x_dtype=dtype,
+        cross_pe = (
+            sp._prepare_positional_embeddings(
+                positions=positions[:, 0:1, :],
+                inner_dim=self.audio_cross_attention_dim,
+                max_pos=[self.cross_pe_max_pos],
+                use_middle_indices_grid=True,
+                num_attention_heads=sp.num_attention_heads,
+                x_dtype=dtype,
+            )
+            if positions is not None
+            else None
         )
         return context, mask, pe, cross_pe
 
