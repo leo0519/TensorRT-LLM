@@ -386,12 +386,10 @@ class LTX2Attention(Attention):
                     sin_pe = sin_pe.view(T_q, self.num_attention_heads, self.head_dim).unsqueeze(0)
                 pe4d = (cos_pe, sin_pe)
                 q = apply_rotary_emb(
-                    q.view(B_q, T_q, self.num_attention_heads, self.head_dim),
-                    pe4d, self.rope_type
+                    q.view(B_q, T_q, self.num_attention_heads, self.head_dim), pe4d, self.rope_type
                 ).view(B_q, T_q, self.num_attention_heads * self.head_dim)
                 k = apply_rotary_emb(
-                    k.view(B_q, T_q, self.num_key_value_heads, self.head_dim),
-                    pe4d, self.rope_type
+                    k.view(B_q, T_q, self.num_key_value_heads, self.head_dim), pe4d, self.rope_type
                 ).view(B_q, T_q, self.num_key_value_heads * self.head_dim)
 
         elif self.qkv_mode == QKVMode.SEPARATE_QKV:
@@ -446,13 +444,15 @@ class LTX2Attention(Attention):
             attn_kwargs["key_padding_mask"] = key_padding_mask
 
         # Layer 3: FA3 FP8 in-patch path for video self-attention.
-        # Uses pre-cached imports (set externally on class attrs _fa3_fp8_fi / _fa3_fp8_qfn)
+        # Uses pre-cached imports (set by step_b_trtllm.py on class attrs _fa3_fp8_fi / _fa3_fp8_qfn)
         # to eliminate per-call import overhead. GPU quantization kernel — no CPU sync for quant.
         _cls = self.__class__
-        if (getattr(_cls, '_fa3_fp8', False)
-                and self.qkv_mode == QKVMode.FUSE_QKV
-                and q.shape[1] == 23760):
-            _fi   = _cls._fa3_fp8_fi   # flashinfer module (pre-cached)
+        if (
+            getattr(_cls, "_fa3_fp8", False)
+            and self.qkv_mode == QKVMode.FUSE_QKV
+            and q.shape[1] == 23760
+        ):
+            _fi = _cls._fa3_fp8_fi  # flashinfer module (pre-cached)
             _qfp8 = _cls._fa3_fp8_qfn  # quantize_fp8_per_tensor (pre-cached)
             B_l3, T_l3, HD = q.shape
             H_l3, D_l3 = self.num_attention_heads, self.head_dim
@@ -465,8 +465,13 @@ class LTX2Attention(Attention):
                 q_fp8.view(T_l3, H_l3, D_l3),
                 k_fp8.view(T_l3, H_l3, D_l3),
                 v_fp8.view(T_l3, H_l3, D_l3),
-                scale_q=q_sc.item(), scale_k=k_sc.item(), scale_v=v_sc.item(),
-                o_dtype=q.dtype, causal=False, backend='fa3')
+                scale_q=q_sc.item(),
+                scale_k=k_sc.item(),
+                scale_v=v_sc.item(),
+                o_dtype=q.dtype,
+                causal=False,
+                backend="fa3",
+            )
             # attn_out: (T, H, D) → (B, T, H*D)
             out = attn_out.reshape(B_l3, T_l3, H_l3 * D_l3)
         else:
@@ -1001,7 +1006,9 @@ class BasicAVTransformerBlock(nn.Module):
                 # Fused gate-residual + RMSNorm (+ optional FP4 quant).
                 # Skip FP4 pre-quantization when cross_attention_adaln will apply adaln
                 # modulation afterwards — the packed Fp4 format cannot be multiplied/added.
-                _need_ca_adaln = hasattr(self, "prompt_scale_shift_table") and video.prompt_timestep is not None
+                _need_ca_adaln = (
+                    hasattr(self, "prompt_scale_shift_table") and video.prompt_timestep is not None
+                )
                 vx, attn2_q_input = apply_fused_gate_resid_rmsnorm(
                     vx,
                     v_attn_raw,
@@ -1009,11 +1016,15 @@ class BasicAVTransformerBlock(nn.Module):
                     vgate_msa_ts,
                     self.norm_eps,
                     self._fuse_adaln,
-                    fp4_input_scale=None if _need_ca_adaln else get_nvfp4_input_scale(self.attn2.to_q),
+                    fp4_input_scale=None
+                    if _need_ca_adaln
+                    else get_nvfp4_input_scale(self.attn2.to_q),
                 )
             else:
                 attn2_q_input = rms_norm(vx, eps=self.norm_eps)
-                _need_ca_adaln = hasattr(self, "prompt_scale_shift_table") and video.prompt_timestep is not None
+                _need_ca_adaln = (
+                    hasattr(self, "prompt_scale_shift_table") and video.prompt_timestep is not None
+                )
             if _need_ca_adaln:
                 # LTX-2.3 cross_attention_adaln: rows 6-8 → shift_q, scale_q, gate_ca
                 (sq_t, sq_ts), (sc_t, sc_ts), (gc_t, gc_ts) = self._get_ada_table_ts_pairs(
@@ -1031,7 +1042,7 @@ class BasicAVTransformerBlock(nn.Module):
                     + video.prompt_timestep.reshape(B, video.prompt_timestep.shape[1], 2, -1)
                 ).unbind(dim=2)
                 _ctx_dtype = video.context.dtype
-                ctx_v = (video.context * (1 + scale_kv.to(_ctx_dtype)) + shift_kv.to(_ctx_dtype))
+                ctx_v = video.context * (1 + scale_kv.to(_ctx_dtype)) + shift_kv.to(_ctx_dtype)
                 # Re-project KV from modulated context (pe=None: text tokens have no RoPE)
                 kv_v = self.attn2.project_kv(ctx_v, pe=None)
                 text_v_attn_raw = self.attn2(
@@ -1082,10 +1093,12 @@ class BasicAVTransformerBlock(nn.Module):
                     a_attn_raw = a_attn_raw * perturbations.mask_like(
                         PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, a_attn_raw
                     )
-                # Fused gate-residual + RMSNorm (+ optional FP4 quant).
                 # Skip FP4 pre-quantization when cross_attention_adaln will apply adaln
                 # modulation afterwards — packed Fp4 format cannot be multiplied/added.
-                _need_a_ca_adaln = hasattr(self, "audio_prompt_scale_shift_table") and audio.prompt_timestep is not None
+                _need_a_ca_adaln = (
+                    hasattr(self, "audio_prompt_scale_shift_table")
+                    and audio.prompt_timestep is not None
+                )
                 ax, audio_attn2_q_input = apply_fused_gate_resid_rmsnorm(
                     ax,
                     a_attn_raw,
@@ -1093,11 +1106,16 @@ class BasicAVTransformerBlock(nn.Module):
                     agate_msa_ts,
                     self.norm_eps,
                     self._fuse_adaln,
-                    fp4_input_scale=None if _need_a_ca_adaln else get_nvfp4_input_scale(self.audio_attn2.to_q),
+                    fp4_input_scale=None
+                    if _need_a_ca_adaln
+                    else get_nvfp4_input_scale(self.audio_attn2.to_q),
                 )
             else:
                 audio_attn2_q_input = rms_norm(ax, eps=self.norm_eps)
-                _need_a_ca_adaln = hasattr(self, "audio_prompt_scale_shift_table") and audio.prompt_timestep is not None
+                _need_a_ca_adaln = (
+                    hasattr(self, "audio_prompt_scale_shift_table")
+                    and audio.prompt_timestep is not None
+                )
             if _need_a_ca_adaln:
                 # LTX-2.3 cross_attention_adaln: rows 6-8 → shift_q, scale_q, gate_ca (audio)
                 (asq_t, asq_ts), (asc_t, asc_ts), (agc_t, agc_ts) = self._get_ada_table_ts_pairs(
@@ -1114,11 +1132,16 @@ class BasicAVTransformerBlock(nn.Module):
                     + audio.prompt_timestep.reshape(B, audio.prompt_timestep.shape[1], 2, -1)
                 ).unbind(dim=2)
                 _ctx_a_dtype = audio.context.dtype
-                ctx_a = (audio.context * (1 + a_scale_kv.to(_ctx_a_dtype)) + a_shift_kv.to(_ctx_a_dtype))
+                ctx_a = audio.context * (1 + a_scale_kv.to(_ctx_a_dtype)) + a_shift_kv.to(
+                    _ctx_a_dtype
+                )
                 # Re-project KV from modulated context (pe=None: text tokens have no RoPE)
                 kv_a = self.audio_attn2.project_kv(ctx_a, pe=None)
                 text_a_attn_raw = self.audio_attn2(
-                    audio_attn2_q_input, context=ctx_a, pre_projected_kv=kv_a, timestep=audio.timesteps
+                    audio_attn2_q_input,
+                    context=ctx_a,
+                    pre_projected_kv=kv_a,
+                    timestep=audio.timesteps,
                 )
                 text_a_attn_raw = text_a_attn_raw * a_gate_ca
             else:
@@ -1944,6 +1967,7 @@ class LTXModel(BaseDiffusionModel):
                 d_head=attention_head_dim,
                 context_dim=cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
+                cross_attention_adaln=True,  # LTX-2.3
             )
             if self.model_type.is_video_enabled()
             else None
@@ -1955,6 +1979,7 @@ class LTXModel(BaseDiffusionModel):
                 d_head=audio_attention_head_dim,
                 context_dim=audio_cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
+                cross_attention_adaln=True,  # LTX-2.3
             )
             if self.model_type.is_audio_enabled()
             else None
@@ -1998,6 +2023,9 @@ class LTXModel(BaseDiffusionModel):
                 args.cross_scale_shift_timestep, dim=1, expected_seq_len=seq_len
             ),
             cross_gate_timestep=sh.shard(args.cross_gate_timestep, dim=1, expected_seq_len=seq_len),
+            prompt_timestep=sh.shard(args.prompt_timestep, dim=1, expected_seq_len=seq_len)
+            if args.prompt_timestep is not None
+            else None,
         )
 
     def _make_pe_local(

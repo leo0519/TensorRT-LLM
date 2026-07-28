@@ -67,7 +67,6 @@ class TransformerArgsPreprocessor:
         self.patchify_proj = patchify_proj
         self.adaln = adaln
         self.caption_projection = caption_projection
-        self.prompt_adaln = prompt_adaln
         self.inner_dim = inner_dim
         self.max_pos = max_pos
         self.num_attention_heads = num_attention_heads
@@ -76,6 +75,7 @@ class TransformerArgsPreprocessor:
         self.double_precision_rope = double_precision_rope
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
+        self.prompt_adaln = prompt_adaln
         self._freq_grid_cache: dict = {}
 
     def _prepare_timestep(
