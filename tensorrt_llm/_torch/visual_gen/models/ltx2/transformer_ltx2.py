@@ -443,15 +443,87 @@ class LTX2Attention(Attention):
         if key_padding_mask is not None:
             attn_kwargs["key_padding_mask"] = key_padding_mask
 
-        # Layer 3: FA3 FP8 in-patch path for video self-attention.
-        # Uses pre-cached imports (set by step_b_trtllm.py on class attrs _fa3_fp8_fi / _fa3_fp8_qfn)
-        # to eliminate per-call import overhead. GPU quantization kernel — no CPU sync for quant.
+        # In-patch FlashInfer paths for the video self-attention. Targeted by the
+        # _is_video_self_attn role flag (not a hard-coded sequence length), so they
+        # work at any resolution / window size. Pre-cached imports are set on class
+        # attrs by step_b_trtllm.py to avoid per-call import overhead.
         _cls = self.__class__
-        if (
-            getattr(_cls, "_fa3_fp8", False)
-            and self.qkv_mode == QKVMode.FUSE_QKV
-            and q.shape[1] == 23760
-        ):
+        _is_v_self = (
+            getattr(self, "_is_video_self_attn", False) and self.qkv_mode == QKVMode.FUSE_QKV
+        )
+        if getattr(_cls, "_nvfp4_attn", False) and _is_v_self and self.head_dim in (64, 128):
+            # FlashInfer NVFP4 attention (sm120): [B, H, S, D] layout, S must be a
+            # multiple of 128 (pad with zeros; padded K/V contribute nothing to the
+            # output, only a tiny softmax-denominator dilution ~pad/S). Q/K/V are
+            # quantized to nvfp4 inside quantize_qkv.
+            #
+            # per_block_mean=False is REQUIRED at large seq: the per-block path
+            # materializes an O(S^2) qk_correction (repeat_interleave -> [B,H,S,S]
+            # fp32, ~72 GiB at S=23808) that OOMs next to the loaded model. It is also
+            # both less accurate (cos 0.934 vs 0.949 on retake latents) and slower, so
+            # there is no reason to enable it. FP4 Q/K/V is the accuracy floor here;
+            # prefer the fp8-sm120 path below for near-lossless quality.
+            _fi = _cls._nvfp4_fi
+            B_n, T_n, _ = q.shape
+            H_n, D_n = self.num_attention_heads, self.head_dim
+            S_pad = ((T_n + 127) // 128) * 128
+            q4 = q.view(B_n, T_n, H_n, D_n).transpose(1, 2).contiguous()
+            k4 = k.view(B_n, T_n, H_n, D_n).transpose(1, 2).contiguous()
+            v4 = v.view(B_n, T_n, H_n, D_n).transpose(1, 2).contiguous()
+            if S_pad != T_n:
+                _p = S_pad - T_n
+                q4 = torch.nn.functional.pad(q4, (0, 0, 0, _p))
+                k4 = torch.nn.functional.pad(k4, (0, 0, 0, _p))
+                v4 = torch.nn.functional.pad(v4, (0, 0, 0, _p))
+            qf, kf, vf, qs, ks, vs, corr = _fi.nvfp4_attention_sm120_quantize_qkv(
+                q4, k4, v4, per_block_mean=False
+            )
+            o, _ = _fi.nvfp4_attention_sm120_fwd(
+                qf, kf, vf, qs, ks, vs, corr, sm_scale=D_n**-0.5, causal=False, per_block_mean=False
+            )
+            out = o[:, :, :T_n, :].transpose(1, 2).reshape(B_n, T_n, H_n * D_n)
+        elif getattr(_cls, "_fp8_sm120_attn", False) and _is_v_self and self.head_dim == 128:
+            # FlashInfer SM120 FMHAv2 FP8 self-attention (anchengc branch). BSHD
+            # layout [B, S, H, D], head_dim=128, per-tensor E4M3 quant with the q/k/v
+            # dequant scales fused into scale_bmm1 (q_s*k_s/sqrt(D)) and scale_bmm2
+            # (v_s). Non-causal for the bidirectional video self-attn; S padded to a
+            # multiple of 128 (padded tokens dilute the softmax denominator by ~pad/S).
+            _fmha = _cls._fp8_sm120_fmha  # pre-cached fmha_v2_prefill_sm120
+            B_f, T_f, _ = q.shape
+            H_f, D_f = self.num_attention_heads, self.head_dim
+            S_pad = ((T_f + 127) // 128) * 128
+            q4 = q.view(B_f, T_f, H_f, D_f)
+            k4 = k.view(B_f, T_f, H_f, D_f)
+            v4 = v.view(B_f, T_f, H_f, D_f)
+            if S_pad != T_f:
+                _pad = (0, 0, 0, 0, 0, S_pad - T_f)  # pad the S dim (dim=1)
+                q4 = torch.nn.functional.pad(q4, _pad)
+                k4 = torch.nn.functional.pad(k4, _pad)
+                v4 = torch.nn.functional.pad(v4, _pad)
+
+            def _q_e4m3(x):
+                s = max(x.abs().max().float().item() / 448.0, 1e-12)
+                return (x / s).to(torch.float8_e4m3fn).contiguous(), s
+
+            q8, qs = _q_e4m3(q4)
+            k8, ks = _q_e4m3(k4)
+            v8, vs = _q_e4m3(v4)
+            o = torch.empty((B_f, S_pad, H_f, D_f), dtype=torch.bfloat16, device=q.device)
+            _fmha(
+                q8,
+                k8,
+                v8,
+                o,
+                num_heads=H_f,
+                head_dim=D_f,
+                seq_len=S_pad,
+                scale_softmax=1.0,
+                scale_bmm1=qs * ks / (D_f**0.5),
+                scale_bmm2=vs,
+                causal=False,
+            )
+            out = o[:, :T_f].reshape(B_f, T_f, H_f * D_f)
+        elif getattr(_cls, "_fa3_fp8", False) and _is_v_self:
             _fi = _cls._fa3_fp8_fi  # flashinfer module (pre-cached)
             _qfp8 = _cls._fa3_fp8_qfn  # quantize_fp8_per_tensor (pre-cached)
             B_l3, T_l3, HD = q.shape
@@ -708,6 +780,9 @@ class BasicAVTransformerBlock(nn.Module):
             enable_sequence_parallel=True,
             async_ulysses=_async_ulysses,
         )
+        # Mark the video self-attention so in-patch FlashInfer paths (FP8 / NVFP4)
+        # target it by role instead of a hard-coded sequence length.
+        self.attn1._is_video_self_attn = True
         self.attn2 = LTX2Attention(
             query_dim=cfg.dim,
             context_dim=cfg.context_dim,
