@@ -451,7 +451,19 @@ class LTX2Attention(Attention):
         _is_v_self = (
             getattr(self, "_is_video_self_attn", False) and self.qkv_mode == QKVMode.FUSE_QKV
         )
-        if getattr(_cls, "_nvfp4_attn", False) and _is_v_self and self.head_dim in (64, 128):
+        # Per-layer backend selection. In mixed mode, _mixed_fp8_layers holds the set
+        # of video-self-attn layer indices that run FP8 (near-lossless) while the rest
+        # run NVFP4 (faster). step_b picks the set — edge (first/last k) or interleaved
+        # (every k-th). Otherwise the class-level _nvfp4_attn / _fp8_sm120_attn flags
+        # apply globally.
+        _fp8set = getattr(_cls, "_mixed_fp8_layers", None)
+        if _fp8set is not None and _is_v_self:
+            _this_fp8 = self.layer_idx in _fp8set
+            _this_nvfp4 = not _this_fp8
+        else:
+            _this_nvfp4 = getattr(_cls, "_nvfp4_attn", False)
+            _this_fp8 = getattr(_cls, "_fp8_sm120_attn", False)
+        if _this_nvfp4 and _is_v_self and self.head_dim in (64, 128):
             # FlashInfer NVFP4 attention (sm120): [B, H, S, D] layout, S must be a
             # multiple of 128 (pad with zeros; padded K/V contribute nothing to the
             # output, only a tiny softmax-denominator dilution ~pad/S). Q/K/V are
@@ -482,7 +494,7 @@ class LTX2Attention(Attention):
                 qf, kf, vf, qs, ks, vs, corr, sm_scale=D_n**-0.5, causal=False, per_block_mean=False
             )
             out = o[:, :, :T_n, :].transpose(1, 2).reshape(B_n, T_n, H_n * D_n)
-        elif getattr(_cls, "_fp8_sm120_attn", False) and _is_v_self and self.head_dim == 128:
+        elif _this_fp8 and _is_v_self and self.head_dim == 128:
             # FlashInfer SM120 FMHAv2 FP8 self-attention (anchengc branch). BSHD
             # layout [B, S, H, D], head_dim=128, per-tensor E4M3 quant with the q/k/v
             # dequant scales fused into scale_bmm1 (q_s*k_s/sqrt(D)) and scale_bmm2
