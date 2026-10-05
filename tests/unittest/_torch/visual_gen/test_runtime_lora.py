@@ -9,8 +9,13 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm._torch.visual_gen.runtime_lora import apply_runtime_lora
+from tensorrt_llm._torch.visual_gen.runtime_lora import (
+    apply_runtime_lora,
+    attach_runtime_lora,
+    set_runtime_lora_enabled,
+)
 from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig
 
 
@@ -400,3 +405,148 @@ def test_pipeline_runtime_lora_strict_partial_component_match_does_not_mutate(
     assert not getattr(pipe.transformer.proj, "_trtllm_runtime_lora_fused", False)
     assert not getattr(pipe.transformer_2.proj, "_trtllm_runtime_lora_fused", False)
     assert pipe._runtime_lora_applications == []
+
+
+def test_runtime_lora_branch_is_toggleable_and_preserves_base_weight(
+    tmp_path: Path,
+) -> None:
+    model = TinyTransformer()
+    with torch.no_grad():
+        model.proj.weight.copy_(torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]))
+    original_weight = model.proj.weight.detach().clone()
+
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "proj.lora_A.weight": torch.tensor([[1.0, 2.0]]),
+            "proj.lora_B.weight": torch.tensor([[0.5], [1.0], [1.5]]),
+        },
+        str(lora_path),
+    )
+
+    report = attach_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path), scale=2.0))
+    x = torch.tensor([[2.0, 3.0]])
+
+    assert report.applied_modules == ("proj",)
+    assert set_runtime_lora_enabled(model, False) == 1
+    torch.testing.assert_close(model.proj.weight, original_weight)
+    torch.testing.assert_close(model.proj(x), torch.nn.functional.linear(x, original_weight))
+
+    assert set_runtime_lora_enabled(model, True) == 1
+    expected_weight = original_weight + torch.tensor([[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]])
+    torch.testing.assert_close(model.proj(x), torch.nn.functional.linear(x, expected_weight))
+    torch.testing.assert_close(model.proj.weight, original_weight)
+
+    assert set_runtime_lora_enabled(model, False) == 1
+    torch.testing.assert_close(model.proj(x), torch.nn.functional.linear(x, original_weight))
+
+
+def test_runtime_lora_branch_uses_trt_linear_integration(tmp_path: Path) -> None:
+    model = nn.Module()
+    model.proj = Linear(2, 3, bias=False, dtype=torch.float32)
+    with torch.no_grad():
+        model.proj.weight.copy_(torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]))
+
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "proj.lora_A.weight": torch.tensor([[1.0, 2.0]]),
+            "proj.lora_B.weight": torch.tensor([[0.5], [1.0], [1.5]]),
+        },
+        str(lora_path),
+    )
+
+    attach_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path), scale=2.0))
+    assert not model.proj._forward_hooks
+    assert set_runtime_lora_enabled(model, True) == 1
+
+    x = torch.tensor([[2.0, 3.0]])
+    expected_weight = model.proj.weight + torch.tensor([[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]])
+    with torch.no_grad():
+        torch.testing.assert_close(model.proj(x), torch.nn.functional.linear(x, expected_weight))
+
+
+@pytest.mark.parametrize("linear_cls", [nn.Linear, Linear])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_runtime_lora_branch_matches_floating_weight_dtype(tmp_path, linear_cls, dtype) -> None:
+    model = nn.Module()
+    # Conversion after construction also tests a stale custom Linear.dtype.
+    model.proj = linear_cls(2, 3, bias=False, dtype=torch.float32).to(dtype=dtype)
+    original_weight = model.proj.weight.detach().clone()
+    a = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+    b = torch.tensor([[0.5], [1.0], [1.5]], dtype=torch.float32)
+    path = tmp_path / "fp32_adapter.safetensors"
+    save_file({"proj.lora_A.weight": a, "proj.lora_B.weight": b}, str(path))
+    attach_runtime_lora(model, RuntimeLoRAConfig(path=str(path)))
+    branch = model.proj._trtllm_runtime_lora_branch
+    assert branch.a_0.dtype == branch.b_0.dtype == dtype
+    x = torch.tensor([[2.0, 3.0]], dtype=dtype)
+    with torch.no_grad():
+        baseline = model.proj(x)
+        set_runtime_lora_enabled(model, True)
+        expected = baseline + torch.nn.functional.linear(
+            torch.nn.functional.linear(x, a.to(dtype)), b.to(dtype)
+        )
+        torch.testing.assert_close(model.proj(x), expected)
+        set_runtime_lora_enabled(model, False)
+        torch.testing.assert_close(model.proj(x), baseline)
+    torch.testing.assert_close(model.proj.weight, original_weight)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("replacement", ["larger_shape", "different_dtype"])
+def test_resident_lora_graph_survives_eager_cache_replacement(replacement: str) -> None:
+    if not hasattr(torch.ops.trtllm, "resident_lora_gemm_add_"):
+        pytest.skip("resident LoRA op requires a rebuilt TensorRT-LLM wheel")
+    op = torch.ops.trtllm.resident_lora_gemm_add_
+    stream = torch.cuda.Stream()
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        x = torch.full((32, 64), 0.125, device="cuda", dtype=torch.bfloat16)
+        a = torch.full((16, 64), 0.125, device="cuda", dtype=torch.bfloat16)
+        b = torch.full((64, 16), 0.125, device="cuda", dtype=torch.bfloat16)
+        output = torch.zeros_like(x)
+        op(output, x, a, b)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            op(output, x, a, b)
+        stream.synchronize()
+
+        dtype = torch.float16 if replacement == "different_dtype" else torch.bfloat16
+        tokens = 4096 if replacement == "larger_shape" else 32
+        other_x = torch.ones((tokens, 64), device="cuda", dtype=dtype)
+        other_output = torch.zeros_like(other_x)
+        op(other_output, other_x, a.to(dtype), b.to(dtype))
+        stream.synchronize()
+        # Reuse freed eager-cache blocks. Replay must not touch these tensors.
+        sentinels = [
+            torch.full((512,), 123.0, device="cuda", dtype=torch.bfloat16) for _ in range(32)
+        ]
+        for fill in (0.125, 0.25):
+            x.fill_(fill)
+            output.zero_()
+            graph.replay()
+            stream.synchronize()
+            for sentinel in sentinels:
+                torch.testing.assert_close(sentinel, torch.full_like(sentinel, 123.0))
+            expected = (x.float() @ a.float().t()) @ b.float().t()
+            torch.testing.assert_close(output.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_resident_lora_native_op_accumulates_into_base_output() -> None:
+    if not hasattr(torch.ops.trtllm, "resident_lora_gemm_add_"):
+        pytest.skip("resident LoRA op requires a rebuilt TensorRT-LLM wheel")
+
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    x = torch.randn((2, 5, 64), device=device, dtype=torch.bfloat16).mul_(0.1)
+    lora_a = torch.randn((16, 64), device=device, dtype=torch.bfloat16).mul_(0.1)
+    lora_b = torch.randn((64, 16), device=device, dtype=torch.bfloat16).mul_(0.1)
+    output = torch.randn((2, 5, 64), device=device, dtype=torch.bfloat16).mul_(0.1)
+    expected = output.float() + (x.float() @ lora_a.float().t()) @ lora_b.float().t()
+
+    with torch.inference_mode():
+        torch.ops.trtllm.resident_lora_gemm_add_(output, x, lora_a, lora_b)
+
+    torch.testing.assert_close(output.float(), expected, rtol=2e-2, atol=2e-2)

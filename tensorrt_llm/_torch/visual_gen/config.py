@@ -501,6 +501,17 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         if "workflow" in resolved_pipeline_config:
             extra_attrs["workflow"] = resolved_pipeline_config["workflow"]
 
+        if resolved_pipeline_config.get("workflow") == "v2v":
+            for key in (
+                "video_vae_path",
+                "audio_vae_path",
+                "iclora_path",
+                "iclora_scale",
+                "iclora_grouped_qkv",
+            ):
+                if key in resolved_pipeline_config:
+                    extra_attrs[key] = resolved_pipeline_config[key]
+
         if "retake_fp8_linear_steps" in resolved_pipeline_config:
             extra_attrs["retake_fp8_linear_steps"] = resolved_pipeline_config[
                 "retake_fp8_linear_steps"

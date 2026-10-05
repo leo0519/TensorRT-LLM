@@ -50,3 +50,11 @@ python models/hunyuan_t2v.py --visual_gen_args configs/hunyuan-t2v-fp8-1gpu.yaml
 Install deps from the repo root: `pip install -r requirements-dev.txt`.
 
 Output: `.png` for image models; `.mp4` for video models when FFmpeg is installed (otherwise `.avi`).
+
+LTX-2.5 IC-LoRA V2V uses the standalone [`models/ltx25_v2v.py`](models/ltx25_v2v.py)
+example and [`configs/ltx25-v2v-1gpu.yaml`](configs/ltx25-v2v-1gpu.yaml). It supports
+split BF16 or packed NVFP4 transformer checkpoints with BF16 attention, one GPU,
+and a fixed 8+3-step schedule. See the [native LTX-2.5 guide](../../tensorrt_llm/_torch/visual_gen/models/ltx25/README.md)
+for the complete command, component paths, and validation limits. Gemma4 requires
+a compatible isolated environment (validated with Transformers 5.14.1); the
+repository's default Transformers pin does not supply this dependency.

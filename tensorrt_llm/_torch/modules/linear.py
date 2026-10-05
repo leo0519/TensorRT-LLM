@@ -1475,14 +1475,27 @@ class NVFP4LinearMethod(LinearMethodBase):
             Tuple of (act_fp4, act_sf, alpha) - quantized activation, per-block scales, and alpha
         """
         if isinstance(input, Fp4QuantizedTensor):
-            # Input is already quantized - this should not happen if pre_quant_scale exists
-            if module.pre_quant_scale is not None or module.force_dynamic_quantization:
+            if module.pre_quant_scale is not None:
                 raise RuntimeError(
-                    "Received pre-quantized FP4 input for a layer that must quantize activations locally "
-                    "(pre_quant_scale is set or dynamic quantization is forced). "
+                    "Received pre-quantized FP4 input for a layer with pre_quant_scale. "
                     "This indicates FP4 output was not disabled in the previous layer."
                 )
-            return input.fp4_tensor, input.scaling_factor, module.alpha
+            if input.dynamic_amax is not None:
+                weight_scale = getattr(module, "weight_scale_2", None)
+                if weight_scale is None:
+                    raise RuntimeError(
+                        "Dynamically quantized FP4 input requires the Linear's weight_scale_2"
+                    )
+                # Preserve the local dynamic-quant operation order exactly so
+                # sharing does not introduce an avoidable rounding difference.
+                alpha = (input.dynamic_amax / (448.0 * 6.0)) * weight_scale
+            elif module.force_dynamic_quantization:
+                raise RuntimeError(
+                    "Received FP4 input without a dynamic input scale for a layer "
+                    "that forces dynamic activation quantization")
+            else:
+                alpha = module.alpha
+            return input.fp4_tensor, input.scaling_factor, alpha
         elif isinstance(input, tuple):
             # Input is a tuple of (fp4_tensor, scaling_factor)
             if module.pre_quant_scale is not None or module.force_dynamic_quantization:
@@ -1527,24 +1540,19 @@ class NVFP4LinearMethod(LinearMethodBase):
         original_shape = None
         if isinstance(input, Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2:
             original_shape = input.fp4_tensor.shape
+            unquantized = input.unquantized_hidden_states
             input = Fp4QuantizedTensor(
                 input.fp4_tensor.reshape(-1, input.fp4_tensor.shape[-1]),
                 input.scaling_factor,
                 input.is_sf_swizzled,
+                (unquantized.reshape(-1, unquantized.shape[-1]) if unquantized
+                 is not None and unquantized.dim() > 2 else unquantized),
+                input.dynamic_amax,
             )
         elif not isinstance(input,
                             (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
             original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
-        elif isinstance(input,
-                        Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2:
-            original_shape = input.fp4_tensor.shape
-            input = Fp4QuantizedTensor(
-                fp4_tensor=input.fp4_tensor.reshape(-1,
-                                                    input.fp4_tensor.shape[-1]),
-                scaling_factor=input.scaling_factor,
-                is_sf_swizzled=input.is_sf_swizzled,
-            )
 
         act_fp4, act_sf, alpha = self._input_prepare(module, input)
 
@@ -3369,6 +3377,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
 
 class Linear(nn.Module):
 
+    _supports_runtime_lora_branch = True
+
     def __init__(
         self,
         in_features: int,
@@ -3833,6 +3843,9 @@ class Linear(nn.Module):
             )
         else:
             output = self.quant_method.apply(self, input, bias)
+        runtime_lora = getattr(self, "_trtllm_runtime_lora_branch", None)
+        if runtime_lora is not None and runtime_lora.enabled:
+            output = runtime_lora.add_to(output, input)
         return output
 
     def apply_linear_allreduce(self,
@@ -3868,8 +3881,13 @@ class Linear(nn.Module):
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
+        runtime_lora = getattr(self, "_trtllm_runtime_lora_branch", None)
+        runtime_lora_enabled = runtime_lora is not None and runtime_lora.enabled
+
         if self.tp_mode == TensorParallelMode.ROW:
-            use_fused_gemm_allreduce = self.use_fused_gemm_allreduce and lora_params is None
+            use_fused_gemm_allreduce = (self.use_fused_gemm_allreduce
+                                        and lora_params is None
+                                        and not runtime_lora_enabled)
             if use_fused_gemm_allreduce and all_reduce_params is not None:
                 use_fused_gemm_allreduce = all_reduce_params.enable_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE
 
@@ -3891,7 +3909,8 @@ class Linear(nn.Module):
                         self.all_reduce is not None and self.quant_method.
                         supports_nccl_symmetric_memory_window_output
                         and self.all_reduce.uses_nccl_symmetric_memory_window()
-                        and not (self.lora is not None and lora_params))
+                        and not (self.lora is not None and lora_params)
+                        and not runtime_lora_enabled)
                     if use_nccl_symmetric_memory_window:
                         output = self.quant_method.apply(self, input, bias)
                     else:

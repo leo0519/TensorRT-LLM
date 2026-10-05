@@ -211,6 +211,11 @@ class Fp4QuantizedTensor:
     # needing the un-quantized form (e.g. DSv3.2's DSA indexer at
     # sparse/dsa.py:pre_indexer_proj) can use it without dequantizing FP4.
     unquantized_hidden_states: Optional[torch.Tensor] = None
+    # Runtime input amax used to create ``fp4_tensor``. Static calibrated
+    # activations leave this unset and use each Linear's precomputed alpha.
+    # Dynamic fan-out paths set it so several Linears can reuse one activation
+    # quantization while deriving their own alpha from ``weight_scale_2``.
+    dynamic_amax: Optional[torch.Tensor] = None
 
     @property
     def shape(self):

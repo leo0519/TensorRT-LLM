@@ -21,3 +21,6 @@ class Modality:
     context: torch.Tensor  # Text embeddings
     enabled: bool = True
     context_mask: torch.Tensor | None = None
+    # LTX-2.5 marks tokens that represent standalone pixel frames. Older
+    # checkpoints leave this unset, so adding the field is behavior-neutral.
+    keyframes_mask: torch.Tensor | None = None

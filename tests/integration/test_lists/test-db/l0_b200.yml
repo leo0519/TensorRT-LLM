@@ -250,6 +250,10 @@ l0_b200:
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  - unittest/_torch/visual_gen/test_ltx25_pipeline.py
+  - unittest/_torch/visual_gen/test_ltx25_transformer.py
+  - unittest/_torch/visual_gen/test_ltx25_v2v.py
+  - unittest/_torch/visual_gen/test_ltx25_optimizations.py
   - unittest/_torch/visual_gen/test_ltx23_transformer.py
   - unittest/_torch/visual_gen/test_ltx23_pipeline.py
   - unittest/_torch/visual_gen/test_wan21_i2v_pipeline.py
@@ -413,6 +417,10 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_audio_against_golden
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_native_bf16_smoke
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_native_bf16_lpips
+  - examples/visual_gen/test_visual_gen_ltx25.py::test_ltx25_native_iclora_smoke[bf16]
+  - examples/visual_gen/test_visual_gen_ltx25.py::test_ltx25_native_iclora_smoke[nvfp4]
+  - examples/visual_gen/test_visual_gen_ltx25.py::test_ltx25_native_iclora_lpips[bf16]
+  - examples/visual_gen/test_visual_gen_ltx25.py::test_ltx25_native_iclora_lpips[nvfp4]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_lpips_matches_eager
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend
   - examples/visual_gen/test_visual_gen_wan.py::test_wan21_t2v_lpips_against_golden

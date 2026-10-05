@@ -29,9 +29,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod, WeightMode
+from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
+from tensorrt_llm._torch.utils import gelu_tanh
 from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
     UlyssesAttention,
     wrap_parallel_attention,
@@ -427,9 +427,7 @@ class LTX2Attention(Attention):
                         "uncached SEPARATE_QKV cross-attn is forbidden; "
                         "pass pre_projected_kv from project_kv(context, pe=...)."
                     )
-                q = self.to_q(x)
-                k = self.to_k(x)
-                v = self.to_v(x)
+                q, k, v = self.get_qkv(x)
                 if use_fused:
                     self.apply_split_norm_or_norm_rope(
                         q, self.norm_q.weight, self.num_attention_heads, pe
@@ -496,26 +494,10 @@ class LTX2Attention(Attention):
         # head_dim check matches the fused split kernel's {64, 128} templates.
         use_fused = self.fuse_qk_norm_rope and self.head_dim in (64, 128) and self.qk_norm
 
-        # Input quant. Self-attn shares ONE fp4 across to_q/to_k/to_v (same input):
-        # reuse q_input if already fp4, else quantize once. Cross-attn quantizes
-        # per input (Q=audio, K/V=video differ) -> each Linear does its own.
+        # Self-attention shares one static or dynamic FP4 activation across
+        # Q/K/V. Cross-attention keeps separate Q and K/V inputs.
         if self_attn:
-            if isinstance(q_input, Fp4QuantizedTensor):
-                q_src = kv_src = q_input
-            elif (
-                self._maybe_share_qkv_quantize
-                # Runtime guard: the two-stage LoRA cache swaps merged Linears to
-                # BF16 UnquantizedLinearMethod (F.linear rejects Fp4QuantizedTensor).
-                and not isinstance(self.to_q.quant_method, UnquantizedLinearMethod)
-                and getattr(self.to_q, "input_scale", None) is not None
-            ):
-                x_2d = q_input.reshape(-1, q_input.shape[-1])
-                fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
-                    x_2d, self.to_q.input_scale, self.to_q.scaling_vector_size, False
-                )
-                q_src = kv_src = Fp4QuantizedTensor(fp4, sf, is_sf_swizzled=False)
-            else:
-                q_src = kv_src = q_input
+            q_src = kv_src = self._prepare_shared_qkv_input(q_input)
         else:
             q_src, kv_src = q_input, kv_input
 
@@ -1805,6 +1787,7 @@ class LTXModel(BaseDiffusionModel):
         )
 
     def _init_preprocessors(self, cross_pe_max_pos):
+        keyframes_embedding_provider = getattr(self, "_keyframes_embedding", None)
         if self.model_type.is_video_enabled() and self.model_type.is_audio_enabled():
             self.video_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.patchify_proj,
@@ -1823,6 +1806,7 @@ class LTXModel(BaseDiffusionModel):
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
                 av_ca_timestep_scale_multiplier=self.av_ca_timestep_scale_multiplier,
+                keyframes_embedding_provider=keyframes_embedding_provider,
             )
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
@@ -1855,6 +1839,7 @@ class LTXModel(BaseDiffusionModel):
                 double_precision_rope=self.double_precision_rope,
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
+                keyframes_embedding_provider=keyframes_embedding_provider,
             )
         elif self.model_type.is_audio_enabled():
             self.audio_args_preprocessor = TransformerArgsPreprocessor(

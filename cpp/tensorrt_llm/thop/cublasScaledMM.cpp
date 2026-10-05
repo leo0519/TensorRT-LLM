@@ -184,9 +184,41 @@ inline at::Tensor const& getWorkspaceTensor(c10::Device device, cudaStream_t str
     return workspace_tensors[key];
 }
 
+inline at::Tensor getResidentLoraIntermediate(
+    c10::Device device, cudaStream_t stream, c10::ScalarType dtype, int64_t numTokens, int64_t rank)
+{
+    auto const options = torch::TensorOptions().dtype(dtype).device(device);
+    cudaStreamCaptureStatus captureStatus;
+    check_cuda_error(cudaStreamIsCapturing(stream, &captureStatus));
+    if (captureStatus != cudaStreamCaptureStatusNone)
+    {
+        // Allocate from PyTorch's graph-private pool. An eager cache may grow or
+        // change dtype after capture; its old storage must not be captured.
+        return torch::empty({numTokens, rank}, options);
+    }
+
+    struct KeyHash
+    {
+        std::size_t operator()(std::pair<int, cudaStream_t> const& key) const noexcept
+        {
+            return std::hash<int>()(key.first) ^ (std::hash<cudaStream_t>()(key.second) << 1);
+        }
+    };
+
+    thread_local std::unordered_map<std::pair<int, cudaStream_t>, at::Tensor, KeyHash> intermediateTensors;
+    auto const key = std::make_pair(device.index(), stream);
+    auto& buffer = intermediateTensors[key];
+    int64_t const requiredElements = numTokens * rank;
+    if (!buffer.defined() || buffer.scalar_type() != dtype || buffer.numel() < requiredElements)
+    {
+        buffer = torch::empty(requiredElements, options);
+    }
+    return buffer.narrow(0, 0, requiredElements).view({numTokens, rank});
+}
+
 void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     std::optional<at::Tensor> const& scale_a, std::optional<at::Tensor> const& scale_b,
-    std::optional<at::Tensor> const& bias, bool fast_acc = false)
+    std::optional<at::Tensor> const& bias, bool fast_acc = false, float beta = 0.0F)
 {
     bool use_scale = false;
     if (scale_a.has_value() && scale_b.has_value())
@@ -258,7 +290,7 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     if (use_bias)
         cublasWrapper->setBiasDescriptor(bias_ptr);
     cublasWrapper->Gemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, /*A=*/b_ptr, /*lda=*/k, /*B=*/a_ptr, /*ldb=*/k, out_ptr,
-        /*ldc=*/n, 1.0F, 0.0F, algo, has_algo, true);
+        /*ldc=*/n, 1.0F, beta, algo, has_algo, true);
     cublasWrapper->destroyDescriptors();
 }
 
@@ -340,6 +372,58 @@ Tensor cublas_mm(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Ten
     return cublas_mm_out(mat_a, mat_b, bias, out);
 }
 
+void resident_lora_gemm_add_(Tensor& output, Tensor const& input, Tensor const& lora_a, Tensor const& lora_b)
+{
+    CHECK_TH_CUDA(output);
+    CHECK_TH_CUDA(input);
+    CHECK_TH_CUDA(lora_a);
+    CHECK_TH_CUDA(lora_b);
+
+    TORCH_CHECK(input.dim() == 2 || input.dim() == 3, "input must be [tokens, hidden] or [batch, tokens, hidden]");
+    TORCH_CHECK(output.dim() == input.dim(), "output and input must have the same rank");
+    TORCH_CHECK(lora_a.dim() == 2 && lora_b.dim() == 2, "LoRA A and B must be 2D");
+    TORCH_CHECK(input.is_contiguous() && output.is_contiguous() && lora_a.is_contiguous() && lora_b.is_contiguous(),
+        "resident LoRA tensors must be contiguous");
+    TORCH_CHECK(
+        input.device() == output.device() && input.device() == lora_a.device() && input.device() == lora_b.device(),
+        "resident LoRA tensors must be on the same CUDA device");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat16 || input.scalar_type() == torch::kBFloat16,
+        "resident LoRA supports float16 and bfloat16 only");
+    TORCH_CHECK(input.scalar_type() == output.scalar_type() && input.scalar_type() == lora_a.scalar_type()
+            && input.scalar_type() == lora_b.scalar_type(),
+        "resident LoRA tensors must have the same dtype");
+
+    for (int64_t dim = 0; dim + 1 < input.dim(); ++dim)
+    {
+        TORCH_CHECK(output.size(dim) == input.size(dim), "output leading dimensions must match input");
+    }
+
+    int64_t const num_tokens = input.numel() / input.size(-1);
+    int64_t const in_features = input.size(-1);
+    int64_t const rank = lora_a.size(0);
+    int64_t const out_features = lora_b.size(0);
+    TORCH_CHECK(rank > 0, "LoRA rank must be positive");
+    TORCH_CHECK(lora_a.size(1) == in_features, "LoRA A input dimension does not match input");
+    TORCH_CHECK(lora_b.size(1) == rank, "LoRA B rank does not match LoRA A");
+    TORCH_CHECK(output.size(-1) == out_features, "LoRA B output dimension does not match output");
+
+    if (num_tokens == 0)
+    {
+        return;
+    }
+
+    auto input_2d = input.view({num_tokens, in_features});
+    auto output_2d = output.view({num_tokens, out_features});
+    auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    auto intermediate
+        = getResidentLoraIntermediate(input.device(), stream.stream(), input.scalar_type(), num_tokens, rank);
+    auto lora_a_t = lora_a.transpose(0, 1);
+    auto lora_b_t = lora_b.transpose(0, 1);
+
+    cublas_gemm_caller(intermediate, input_2d, lora_a_t, at::nullopt, at::nullopt, at::nullopt);
+    cublas_gemm_caller(output_2d, intermediate, lora_b_t, at::nullopt, at::nullopt, at::nullopt, false, 1.0F);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -353,10 +437,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype,"
         " int output_buffer_kind=0, int[]? group=None) -> (Tensor out)");
+    m.def("resident_lora_gemm_add_(Tensor(a!) output, Tensor input, Tensor lora_a, Tensor lora_b) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("cublas_scaled_mm", &tensorrt_llm::torch_ext::cublas_scaled_mm);
     m.impl("cublas_mm", &tensorrt_llm::torch_ext::cublas_mm);
+    m.impl("resident_lora_gemm_add_", &tensorrt_llm::torch_ext::resident_lora_gemm_add_);
 }

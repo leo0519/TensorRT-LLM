@@ -25,6 +25,7 @@ import safetensors.torch
 import torch
 import torch.nn as nn
 
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig
 
@@ -73,7 +74,7 @@ class _RuntimeLoRAAdapter:
 @dataclass(frozen=True)
 class _PreparedRuntimeLoRADelta:
     adapter: _RuntimeLoRAAdapter
-    delta: torch.Tensor
+    delta: Optional[torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,94 @@ class _PreparedRuntimeLoRATarget:
 class _RuntimeLoRAPlan:
     application: RuntimeLoRAApplication
     targets: Tuple[_PreparedRuntimeLoRATarget, ...]
+
+
+class RuntimeLoRABranch(nn.Module):
+    """Resident low-rank branch added to a linear without changing its base weight."""
+
+    def __init__(
+        self,
+        adapters: Iterable[_RuntimeLoRAAdapter],
+        output_features: int,
+    ) -> None:
+        super().__init__()
+        adapters = tuple(adapters)
+        if not adapters:
+            raise ValueError("Runtime LoRA branch requires at least one adapter")
+        self.enabled = False
+        self.output_features = output_features
+        self._output_spans: list[tuple[Optional[int], Optional[int]]] = []
+        for index, adapter in enumerate(adapters):
+            self.register_buffer(f"a_{index}", adapter.a.contiguous(), persistent=False)
+            self.register_buffer(
+                f"b_{index}",
+                adapter.b.mul(float(adapter.scale)).contiguous(),
+                persistent=False,
+            )
+            self._output_spans.append((adapter.output_start, adapter.output_end))
+        self._native_op_available = hasattr(torch.ops.trtllm, "resident_lora_gemm_add_")
+
+    @staticmethod
+    def _floating_input(x: torch.Tensor | Fp4QuantizedTensor) -> torch.Tensor:
+        if isinstance(x, Fp4QuantizedTensor):
+            x = x.unquantized_hidden_states
+            if x is None:
+                raise ValueError(
+                    "Runtime LoRA requires an Fp4QuantizedTensor with an unquantized view"
+                )
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(
+                "Runtime LoRA branches require the original floating-point linear input"
+            )
+        return x
+
+    def _delta(self, x: torch.Tensor) -> torch.Tensor:
+        if len(self._output_spans) == 1 and self._output_spans[0][0] is None:
+            return torch.nn.functional.linear(torch.nn.functional.linear(x, self.a_0), self.b_0)
+
+        result = x.new_zeros((*x.shape[:-1], self.output_features))
+        for index, (output_start, output_end) in enumerate(self._output_spans):
+            delta = torch.nn.functional.linear(
+                torch.nn.functional.linear(x, getattr(self, f"a_{index}")),
+                getattr(self, f"b_{index}"),
+            )
+            if output_start is None:
+                result.add_(delta)
+            else:
+                result[..., output_start:output_end].add_(delta)
+        return result
+
+    def _can_use_native(self, output: torch.Tensor, x: torch.Tensor) -> bool:
+        return (
+            self._native_op_available
+            and len(self._output_spans) == 1
+            and self._output_spans[0][0] is None
+            and not torch.is_grad_enabled()
+            and x.is_cuda
+            and output.is_cuda
+            and x.is_contiguous()
+            and output.is_contiguous()
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and output.dtype == x.dtype == self.a_0.dtype == self.b_0.dtype
+            and x.device == output.device == self.a_0.device == self.b_0.device
+            and x.shape[:-1] == output.shape[:-1]
+            and x.shape[-1] == self.a_0.shape[1]
+            and output.shape[-1] == self.b_0.shape[0]
+        )
+
+    def add_to(
+        self,
+        output: torch.Tensor,
+        x: torch.Tensor | Fp4QuantizedTensor,
+    ) -> torch.Tensor:
+        x = self._floating_input(x)
+        if self._can_use_native(output, x):
+            torch.ops.trtllm.resident_lora_gemm_add_(output, x, self.a_0, self.b_0)
+            return output
+        return output.add_(self._delta(x).to(dtype=output.dtype))
+
+    def forward(self, x: torch.Tensor | Fp4QuantizedTensor) -> torch.Tensor:
+        return self._delta(self._floating_input(x))
 
 
 def apply_runtime_lora(
@@ -109,12 +198,60 @@ def apply_runtime_lora(
     return application
 
 
+def attach_runtime_lora(
+    transformer: nn.Module,
+    config: RuntimeLoRAConfig,
+    *,
+    default_strip_prefixes: Iterable[str] = (),
+    raise_on_no_matches: bool = True,
+) -> RuntimeLoRAApplication:
+    """Attach toggleable A/B branches while preserving quantized base weights."""
+    plan = _prepare_runtime_lora(
+        transformer,
+        config,
+        default_strip_prefixes=default_strip_prefixes,
+        raise_on_no_matches=raise_on_no_matches,
+        materialize_deltas=False,
+    )
+    for target in plan.targets:
+        branch = RuntimeLoRABranch(
+            (prepared.adapter for prepared in target.deltas),
+            int(target.base_layer.out_features),
+        )
+        target.base_layer.add_module("_trtllm_runtime_lora_branch", branch)
+        # TensorRT-LLM Linear calls branch.add_to() from apply_linear so it can
+        # use the native in-place path. Keep a hook fallback for torch.nn.Linear.
+        if not getattr(target.base_layer, "_supports_runtime_lora_branch", False):
+            target.base_layer.register_forward_hook(_runtime_lora_forward_hook)
+    logger.info(
+        f"Runtime LoRA branches attached from {plan.application.path}: "
+        f"applied={len(plan.application.applied_modules)}"
+    )
+    return plan.application
+
+
+def set_runtime_lora_enabled(transformer: nn.Module, enabled: bool) -> int:
+    """Toggle every resident low-rank branch below a transformer."""
+    branches = [module for module in transformer.modules() if isinstance(module, RuntimeLoRABranch)]
+    for branch in branches:
+        branch.enabled = enabled
+    return len(branches)
+
+
+def _runtime_lora_forward_hook(module: nn.Module, args: tuple, output: torch.Tensor):
+    branch = module._trtllm_runtime_lora_branch
+    if not branch.enabled:
+        return None
+    return branch.add_to(output, args[0])
+
+
 def _prepare_runtime_lora(
     transformer: nn.Module,
     config: RuntimeLoRAConfig,
     *,
     default_strip_prefixes: Iterable[str] = (),
     raise_on_no_matches: bool = True,
+    materialize_deltas: bool = True,
 ) -> _RuntimeLoRAPlan:
     """Validate and stage startup LoRA deltas without mutating transformer weights."""
 
@@ -203,6 +340,8 @@ def _prepare_runtime_lora(
         base_module = modules[module_name]
         if getattr(base_module, "_trtllm_runtime_lora_fused", False):
             raise ValueError(f"Runtime LoRA target '{module_name}' is already fused")
+        if hasattr(base_module, "_trtllm_runtime_lora_branch"):
+            raise ValueError(f"Runtime LoRA target '{module_name}' already has a branch")
         if not _is_linear_like(base_module):
             if config.strict:
                 raise ValueError(
@@ -214,7 +353,12 @@ def _prepare_runtime_lora(
 
         try:
             prepared_targets.append(
-                _prepare_lora_target_for_fusion(base_module, adapters, module_name)
+                _prepare_lora_target_for_fusion(
+                    base_module,
+                    adapters,
+                    module_name,
+                    materialize_deltas=materialize_deltas,
+                )
             )
         except ValueError:
             if config.strict:
@@ -257,11 +401,18 @@ def _prepare_lora_target_for_fusion(
     base_layer: nn.Module,
     adapters: Iterable[_RuntimeLoRAAdapter],
     module_name: str,
+    *,
+    materialize_deltas: bool = True,
 ) -> _PreparedRuntimeLoRATarget:
     weight = getattr(base_layer, "weight", None)
     if not isinstance(weight, torch.Tensor) or weight.is_meta:
         raise ValueError(f"Runtime LoRA target '{module_name}' has no loaded weight tensor")
-    if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+    if materialize_deltas and weight.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+    ):
         raise ValueError(
             f"Runtime LoRA target '{module_name}' cannot fuse into weight dtype {weight.dtype}"
         )
@@ -273,17 +424,36 @@ def _prepare_lora_target_for_fusion(
     with torch.no_grad():
         for adapter in adapters:
             local_adapter = _shard_adapter(base_layer, adapter, module_name, device)
+            if not materialize_deltas:
+                # nn.Linear has no dtype attribute, and a later .to(dtype=...)
+                # can leave a custom Linear's declared dtype stale. For floating
+                # weights, their actual dtype determines the linear input dtype.
+                activation_dtype = (
+                    weight.dtype
+                    if weight.is_floating_point()
+                    else getattr(base_layer, "dtype", None)
+                )
+                if activation_dtype not in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                    torch.float64,
+                ):
+                    activation_dtype = adapter.a.dtype
+                local_adapter = _cast_adapter(local_adapter, activation_dtype)
             _validate_adapter_for_fusion(local_adapter, module_name, in_features, out_features)
-            _validate_lora_delta_shape_for_adapter(weight, local_adapter, module_name)
-            delta = _compute_lora_weight_delta(local_adapter, device, weight.dtype)
-            delta = _prepare_lora_delta_for_weight(weight, delta, local_adapter, module_name)
-            target = _lora_weight_target(weight, local_adapter, module_name)
-            _validate_lora_delta_shape(
-                tuple(delta.shape),
-                tuple(target.shape),
-                local_adapter,
-                module_name,
-            )
+            delta = None
+            if materialize_deltas:
+                _validate_lora_delta_shape_for_adapter(weight, local_adapter, module_name)
+                delta = _compute_lora_weight_delta(local_adapter, device, weight.dtype)
+                delta = _prepare_lora_delta_for_weight(weight, delta, local_adapter, module_name)
+                target = _lora_weight_target(weight, local_adapter, module_name)
+                _validate_lora_delta_shape(
+                    tuple(delta.shape),
+                    tuple(target.shape),
+                    local_adapter,
+                    module_name,
+                )
             prepared_deltas.append(_PreparedRuntimeLoRADelta(local_adapter, delta))
     return _PreparedRuntimeLoRATarget(module_name, base_layer, tuple(prepared_deltas))
 
@@ -298,6 +468,8 @@ def _fuse_lora_into_linear(
         raise ValueError(f"Runtime LoRA target '{module_name}' has no loaded weight tensor")
     with torch.no_grad():
         for prepared_delta in prepared_deltas:
+            if prepared_delta.delta is None:
+                raise ValueError(f"Runtime LoRA target '{module_name}' has no materialized delta")
             _add_lora_delta_to_weight(
                 weight,
                 prepared_delta.delta,
@@ -631,6 +803,18 @@ def _tp_mode_value(tp_mode) -> Optional[str]:
     if tp_mode is None:
         return None
     return getattr(tp_mode, "value", str(tp_mode))
+
+
+def _cast_adapter(
+    adapter: _RuntimeLoRAAdapter,
+    dtype: torch.dtype,
+) -> _RuntimeLoRAAdapter:
+    return _RuntimeLoRAAdapter(
+        adapter.a.to(dtype=dtype),
+        adapter.b.to(dtype=dtype),
+        adapter.scale,
+        adapter.output_start,
+    )
 
 
 def _shard_adapter(

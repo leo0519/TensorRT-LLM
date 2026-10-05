@@ -231,10 +231,11 @@ class AutoPipeline:
         except Exception:
             return None
 
-        if "transformer" in config and ("vae" in config or "audio_vae" in config):
-            # Imported here because pipeline_ltx23 imports register_pipeline from
+        is_ltx25_split = config.get("transformer", {}).get("use_keyframes_abs_pos_embedding") is True
+        if "transformer" in config and ("vae" in config or "audio_vae" in config or is_ltx25_split):
+            # Imported here because pipeline_ltx25 imports register_pipeline from
             # this module at import time.
-            from .models.ltx23.pipeline_ltx23 import detect_native_ltx_pipeline
+            from .models.ltx25.pipeline_ltx25 import detect_native_ltx_pipeline
 
             detected = detect_native_ltx_pipeline(config)
             logger.info(

@@ -5,6 +5,7 @@
 # Orchestration logic that wires patchify, AdaLN, caption projection, and RoPE
 # generation into a unified TransformerArgs dataclass for the transformer blocks.
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import torch
@@ -18,6 +19,23 @@ from .rope import (
     precompute_freqs_cis,
 )
 from .text_projection import PixArtAlphaTextProjection
+
+KeyframesEmbeddingProvider = Callable[[], torch.Tensor | None]
+
+
+def apply_keyframes_absolute_embedding(
+    hidden_states: torch.Tensor,
+    keyframes_mask: torch.Tensor | None,
+    embedding_provider: KeyframesEmbeddingProvider | None,
+) -> torch.Tensor:
+    """Apply LTX-2.5's learned marker to standalone-frame tokens."""
+    if embedding_provider is None or keyframes_mask is None:
+        return hidden_states
+    embedding = embedding_provider()
+    if embedding is None:
+        return hidden_states
+    mask = (keyframes_mask > 0).to(dtype=hidden_states.dtype)
+    return hidden_states + mask * embedding.to(dtype=hidden_states.dtype)
 
 
 @dataclass(frozen=True)
@@ -59,6 +77,7 @@ class TransformerArgsPreprocessor:
         double_precision_rope: bool,
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
+        keyframes_embedding_provider: KeyframesEmbeddingProvider | None = None,
     ) -> None:
         self.patchify_proj = patchify_proj
         self.adaln = adaln
@@ -71,6 +90,7 @@ class TransformerArgsPreprocessor:
         self.double_precision_rope = double_precision_rope
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
+        self.keyframes_embedding_provider = keyframes_embedding_provider
         self._freq_grid_cache: dict = {}
 
     def _prepare_timestep(
@@ -167,6 +187,11 @@ class TransformerArgsPreprocessor:
         is only used by the MultiModal subclass; ignored here.
         """
         x = self.patchify_proj(modality.latent.contiguous())
+        x = apply_keyframes_absolute_embedding(
+            x,
+            modality.keyframes_mask,
+            self.keyframes_embedding_provider,
+        )
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], modality.latent.dtype
         )
@@ -205,6 +230,7 @@ class MultiModalTransformerArgsPreprocessor:
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
         av_ca_timestep_scale_multiplier: int,
+        keyframes_embedding_provider: KeyframesEmbeddingProvider | None = None,
     ) -> None:
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
@@ -218,6 +244,7 @@ class MultiModalTransformerArgsPreprocessor:
             double_precision_rope=double_precision_rope,
             positional_embedding_theta=positional_embedding_theta,
             rope_type=rope_type,
+            keyframes_embedding_provider=keyframes_embedding_provider,
         )
         self.cross_scale_shift_adaln = cross_scale_shift_adaln
         self.cross_gate_adaln = cross_gate_adaln

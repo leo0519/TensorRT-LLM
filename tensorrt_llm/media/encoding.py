@@ -9,9 +9,12 @@ import subprocess  # nosec B404
 import tempfile
 import wave
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 import torch
 from PIL import Image
@@ -21,6 +24,56 @@ from tensorrt_llm.logger import logger
 # Video encoder availability flags (cached after first check).
 _FFMPEG_PATH: Optional[str] = None
 _VIDEO_ENCODER: Optional["_VideoEncoder"] = None
+_VIDEO_ENCODING_ARGS: ContextVar[tuple[str, ...] | None] = ContextVar(
+    "video_encoding_args", default=None
+)
+
+
+@contextmanager
+def video_encoding_options(
+    *,
+    codec: Literal["libx264", "h264_nvenc"] = "libx264",
+    preset: str | None = None,
+    quality: int = 23,
+) -> Iterator[None]:
+    """Scope FFmpeg save settings to the current thread/task, restoring on exit.
+
+    Defaults preserve libx264 medium/CRF23. NVENC uses VBR/CQ (not equivalent
+    to CRF) and defaults to p4. Explicit unavailable encoders fail rather than
+    silently falling back. Wrap save(), not model generation, in this context.
+    """
+    if type(quality) is not int or not 0 <= quality <= 51:
+        raise ValueError("Video quality must be an integer in [0, 51].")
+    if codec == "libx264":
+        preset = preset or "medium"
+        if preset not in ("medium", "veryfast"):
+            raise ValueError("libx264 preset must be medium or veryfast.")
+        options = ("-c:v", codec, "-pix_fmt", "yuv420p", "-preset", preset, "-crf", str(quality))
+    elif codec == "h264_nvenc":
+        preset = preset or "p4"
+        if preset not in ("p4", "p5", "p6"):
+            raise ValueError("h264_nvenc preset must be p4, p5 or p6.")
+        options = (
+            "-c:v",
+            codec,
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            preset,
+            "-rc",
+            "vbr",
+            "-cq",
+            str(quality),
+            "-b:v",
+            "0",
+        )
+    else:
+        raise ValueError(f"Unsupported video codec: {codec}")
+    token = _VIDEO_ENCODING_ARGS.set(options)
+    try:
+        yield
+    finally:
+        _VIDEO_ENCODING_ARGS.reset(token)
 
 
 def _check_ffmpeg_available() -> bool:
@@ -148,6 +201,16 @@ class _FfmpegCliEncoder(_VideoEncoder):
                 audio_output_args = ["-c:a", "aac", "-shortest"]
 
             ffmpeg_path = _get_ffmpeg_path()
+            video_output_args = _VIDEO_ENCODING_ARGS.get() or (
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "medium",
+                "-crf",
+                "23",
+            )
             cmd = [
                 ffmpeg_path,
                 "-y",
@@ -162,14 +225,7 @@ class _FfmpegCliEncoder(_VideoEncoder):
                 "-i",
                 "-",
                 *audio_input_args,
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-preset",
-                "medium",
-                "-crf",
-                "23",
+                *video_output_args,
                 *audio_output_args,
                 output_path,
             ]
@@ -218,6 +274,8 @@ class _PurePythonEncoder(_VideoEncoder):
         audio: Optional[torch.Tensor] = None,
         audio_sample_rate: int = 24000,
     ) -> str:
+        if _VIDEO_ENCODING_ARGS.get() is not None:
+            raise RuntimeError("Explicit video encoding options require the FFmpeg encoder")
         if audio is not None:
             logger.warning(
                 "Pure-Python video encoder does not support audio; audio will be ignored."
@@ -458,6 +516,8 @@ def _save_encoded_video(
 ) -> str:
     """Encode video (and optional audio) to ``output_path`` via the best encoder."""
     encoder = _get_video_encoder()
+    if _VIDEO_ENCODING_ARGS.get() is not None and not isinstance(encoder, _FfmpegCliEncoder):
+        raise RuntimeError("Explicit video encoding options require FFmpeg.")
     if isinstance(encoder, _PurePythonEncoder) and output_path.lower().endswith(".mp4"):
         raise RuntimeError(
             "MP4 format requires ffmpeg to be installed. Please install ffmpeg "

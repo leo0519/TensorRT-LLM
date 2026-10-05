@@ -136,18 +136,15 @@ class Attention(nn.Module):
         self._calculate_tp_parameters(ulysses_size if enable_sequence_parallel else None)
         self._init_qkv_proj()
 
-        # Structural eligibility for SEPARATE_QKV self-attn quantize dedup.
-        # When True, get_qkv() may pre-quantize hidden_states once and pass the
-        # shared Fp4QuantizedTensor to to_q/to_k/to_v (relies on Linear's
-        # Fp4QuantizedTensor shortcut). Numerical equality of the per-tensor
-        # input_scales is an invariant of modelopt's self-attn calibration
-        # (q/k/v share the same input distribution -> same calibrated scale).
+        # Structural eligibility for SEPARATE_QKV self-attn quantize dedup. The
+        # runtime path supports both calibrated and forced-dynamic activation
+        # scales. Q/K/V consume the same logical activation, so one packed FP4
+        # view is sufficient; each projection still derives its own GEMM alpha.
         self._maybe_share_qkv_quantize = (
             self.qkv_mode == QKVMode.SEPARATE_QKV
             and self.quant_config is not None
             and getattr(self.quant_config, "layer_quant_mode", None) is not None
             and self.quant_config.layer_quant_mode.has_nvfp4()
-            and not self.force_dynamic_quantization
         )
 
         attention_metadata_state = getattr(config, "attention_metadata_state", None)
@@ -386,11 +383,64 @@ class Attention(nn.Module):
                 override_tp_sharding=(self.local_kv_dim_start, self.local_kv_dim_end),
             )
 
+    def _prepare_shared_qkv_input(
+        self,
+        hidden_states: torch.Tensor | Fp4QuantizedTensor,
+    ) -> torch.Tensor | Fp4QuantizedTensor:
+        """Quantize a shared self-attention input once for Q, K, and V."""
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            return hidden_states
+        if not self._maybe_share_qkv_quantize:
+            return hidden_states
+
+        projections = (self.to_q, self.to_k, self.to_v)
+        if not all(
+            getattr(getattr(projection, "quant_method", None), "quantizes_nvfp4_activations", False)
+            for projection in projections
+        ):
+            return hidden_states
+
+        dynamic = any(
+            getattr(projection, "force_dynamic_quantization", False)
+            or getattr(projection, "input_scale", None) is None
+            for projection in projections
+        )
+        if dynamic:
+            fp4_max = 448.0 * 6.0
+            amax_input = torch.amax(torch.abs(hidden_states)).float()
+            input_scale = fp4_max / amax_input
+        else:
+            input_scale = self.to_q.input_scale
+            if input_scale is None:
+                return hidden_states
+
+        x_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
+        fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
+            x_2d,
+            input_scale,
+            self.to_q.scaling_vector_size,
+            False,
+        )
+        return Fp4QuantizedTensor(
+            fp4,
+            sf,
+            is_sf_swizzled=False,
+            unquantized_hidden_states=hidden_states if dynamic else None,
+            dynamic_amax=amax_input if dynamic else None,
+        )
+
     def get_qkv(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        grouped_lora = getattr(self, "_grouped_runtime_lora", None)
+        if (
+            grouped_lora is not None
+            and encoder_hidden_states is None
+            and grouped_lora.can_apply(hidden_states)
+        ):
+            return grouped_lora.project(self, hidden_states)
         if self.qkv_mode == QKVMode.FUSE_QKV:
             qkv = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
@@ -688,23 +738,9 @@ class Attention(nn.Module):
         # has no async analog here.
         use_fused = self.fuse_qk_norm_rope and freqs is not None and self.qk_norm
 
-        # SEPARATE_QKV self-attn shares ONE input quant across to_q/to_k/to_v (never 3):
-        #   * hidden_states already an Fp4QuantizedTensor -> an upstream fused norm+quant AdaLN
-        #     pre-quantized it once (with to_q.input_scale); reuse it directly -> 0 quant here.
-        #   * else eligible -> quantize once and share the Fp4QuantizedTensor -> 1 quant here.
-        #   * else -> bf16, each Linear quantizes its own (non-NVFP4 / NVFP4-excluded layers).
-        # Eligibility is structural (set in __init__); the runtime gate checks the checkpoint
-        # loaded an input_scale (some attn Linears are NVFP4-excluded -- e.g. LTX-2 blocks.10.attn1).
-        if isinstance(hidden_states, Fp4QuantizedTensor):
-            qkv_input = hidden_states
-        elif self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
-            x_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
-            fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
-                x_2d, self.to_q.input_scale, self.to_q.scaling_vector_size, False
-            )
-            qkv_input = Fp4QuantizedTensor(fp4, sf, is_sf_swizzled=False)
-        else:
-            qkv_input = hidden_states
+        # Reuse one packed activation for all three projections. In forced
+        # dynamic mode the carrier also retains BF16 for resident LoRA.
+        qkv_input = self._prepare_shared_qkv_input(hidden_states)
 
         def compute_q():
             q = self.to_q(qkv_input)
